@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#171009">
+<title>CoffeeScale</title>
+<link rel="manifest" href="./manifest.json">
+<link rel="icon" href="./icon-192.png">
+<style>
+:root{color-scheme:dark;--bg:#171009;--panel:#221810;--ink:#F3EAD9;--muted:#BFA88F;--accent:#D9A648;--line:#3A2A1A}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:"Segoe UI",system-ui,sans-serif;min-height:100svh}
+main{max-width:430px;margin:auto;padding:max(24px,env(safe-area-inset-top)) 20px max(28px,env(safe-area-inset-bottom));min-height:100svh;display:flex;flex-direction:column}
+header{display:flex;align-items:center;justify-content:space-between;gap:12px}
+h1{font-size:21px;letter-spacing:-.03em;margin:0;font-weight:600}
+button{font:inherit;border:1px solid var(--line);border-radius:12px;background:var(--panel);color:var(--ink);padding:12px 16px;min-height:44px;cursor:pointer}
+button:disabled{opacity:.45;cursor:default}
+button:focus-visible,a:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+.reading{margin:auto 0;text-align:center;padding:50px 0 42px}
+#g{font-family:Consolas,ui-monospace,monospace;font-size:clamp(64px,22vw,104px);line-height:1.15;letter-spacing:-.055em;font-variant-numeric:tabular-nums}
+.unit{font-size:13px;color:var(--muted);letter-spacing:.16em;margin-top:12px}
+#bTare{width:100%;font-size:22px;font-weight:600;min-height:68px;background:var(--accent);color:#241505;border:0;border-radius:16px}
+#connection{min-height:42px;text-align:center;font-size:13px;line-height:1.5;color:var(--muted);margin:16px 0 0}
+#cal{display:block;min-height:22px;text-align:center;color:var(--muted);font-size:12px;margin:4px 0 16px}
+details{border-top:1px solid var(--line);padding-top:8px;color:var(--muted);font-size:13px}
+summary{cursor:pointer;padding:10px 0}
+details p{line-height:1.6}a{color:var(--accent)}[hidden]{display:none!important}
+#installHelp{font-size:12px;line-height:1.5;color:var(--muted);text-align:center;margin:18px 0 0}
+</style>
+</head>
+<body>
+<main>
+<header><h1>CoffeeScale</h1><button id="installApp" hidden>Install</button></header>
+<div class="reading"><div id="g" aria-label="Weight">—</div><div class="unit">GRAMS</div></div>
+<button id="bTare" disabled>Tare</button>
+<p id="connection" role="status">Pair your scale once to begin</p>
+<small id="cal"></small>
+<details id="scaleSettings" open><summary>Scale connection</summary>
+<button id="pairScale">Pair scale</button>
+<div id="setupHelp"><p>Turn the scale on and tap Pair scale. Keep your phone and scale on the same WiFi.</p><p>If the scale needs WiFi setup, join <b>CoffeeScale-Setup</b> in your phone’s WiFi settings, then tap <a href="http://192.168.4.1/" target="_blank" rel="noopener">Set up scale WiFi</a>. Return your phone to your home WiFi and pair here.</p></div>
+</details>
+<p id="installHelp">Chrome menu → Add to Home screen → Install.</p>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const mem = {};
+const store = {
+  get(k) { try { const v = localStorage.getItem(k); if (v !== null) mem[k] = v; return v; } catch (e) { return mem[k] ?? null; } },
+  set(k, v) { mem[k] = v; try { localStorage.setItem(k, v); } catch (e) {} }
+};
+let tickBusy = false, postBusy = false;
+function setStatus(text) { $('cal').textContent = text; }
+// Installed phone app: Bluetooth pairs once; WiFi handles every scale request.
+const SCALE_HOST = 'coffeescale.local';
+const DISCOVERY_SERVICE = '72cf0001-5dc4-4a38-8f16-7b63ad328a20';
+const DISCOVERY_ADDRESS = '72cf0002-5dc4-4a38-8f16-7b63ad328a20';
+const link = { pair: null, base: '', connected: false, finding: false, running: false, retryAt: 0, hostNext: false, queue: Promise.resolve() };
+let installPrompt = null, wakeLock = null;
+
+function scaleURL(address) {
+  const u = new URL('http://' + address);
+  const p = address.split('.').map(Number);
+  const privateIP = /^\d+\.\d+\.\d+\.\d+$/.test(address) && p.every(n => n >= 0 && n <= 255)
+    && (p[0] === 10 || (p[0] === 172 && p[1] >= 16 && p[1] <= 31) || (p[0] === 192 && p[1] === 168));
+  if (address !== SCALE_HOST && !privateIP) throw new Error('The scale sent an invalid WiFi address.');
+  return u.origin;
+}
+try {
+  const p = JSON.parse(store.get('cs_pair') || 'null');
+  if (p && /^[a-f0-9]{12}$/.test(p.id)) { scaleURL(p.ip); link.pair = p; link.base = scaleURL(p.ip); }
+} catch (e) {}
+
+function syncControls() {
+  $('bTare').disabled = !link.connected || postBusy;
+  $('pairScale').disabled = link.finding || link.running || postBusy;
+  $('pairScale').textContent = link.pair ? 'Pair another scale' : 'Pair scale';
+  $('setupHelp').hidden = !!link.pair;
+}
+function disconnected(message) {
+  link.connected = false;
+  $('connection').textContent = message || (link.pair ? 'Waiting for your scale — turn it on' : 'Pair your scale once to begin');
+  $('g').textContent = '—';
+  syncControls();
+}
+function validateReading(d) {
+  if (!d || !link.pair || d.device_id !== link.pair.id) throw new Error('Waiting for your paired CoffeeScale');
+  if (!Number.isFinite(d.g) || !Number.isFinite(d.timer_s) || d.timer_s < 0 || typeof d.running !== 'boolean') throw new Error('The scale needs a firmware update.');
+  // Accept identity even when uncalibrated, but never present a faulty sensor as live weight.
+  if (d.sensor_ok !== true) throw new Error('Scale sensor is not responding');
+  link.running = d.running;
+  if (d.ip && d.ip !== '0.0.0.0') {
+    try { link.base = scaleURL(d.ip); link.pair.ip = d.ip; store.set('cs_pair', JSON.stringify(link.pair)); } catch (e) {}
+  }
+  return d;
+}
+async function scaleRequest(base, path, ms, method = 'GET') {
+  const ctrl = new AbortController(), timeout = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const r = await fetch(base + path, { method, signal: ctrl.signal, mode: 'cors', credentials: 'omit', cache: 'no-store', targetAddressSpace: 'local' });
+    const d = await r.json();
+    if (!r.ok || d.err) throw new Error(d.err || 'Scale request failed (' + r.status + ')');
+    return d;
+  } finally { clearTimeout(timeout); }
+}
+// One queue includes discovery probes, tare and polling.
+// Commands are never retried: a timeout can mean the board already performed them.
+function getJSON(path, ms, method = 'GET') {
+  const job = link.queue.then(async () => {
+    if (!link.pair || link.finding) return { ok: false, err: 'Pair your scale to begin' };
+    if (document.visibilityState === 'hidden' && method === 'GET') return { ok: false, err: 'App is in the background' };
+    try {
+      if (method !== 'GET') {
+        if (!link.connected) return { ok: false, err: 'Waiting for your scale' };
+        // Confirm identity before a write, in case DHCP reassigned the remembered address.
+        validateReading(await scaleRequest(link.base, '/api/weight', 2500));
+        const value = await scaleRequest(link.base, path, ms, method);
+        return { ok: true, value };
+      }
+      if (!link.connected) {
+        if (Date.now() < link.retryAt) return { ok: false, err: 'Waiting for your scale' };
+        link.base = scaleURL(link.hostNext ? SCALE_HOST : link.pair.ip);
+        link.hostNext = !link.hostNext;
+      }
+      const value = validateReading(await scaleRequest(link.base, path, ms));
+      link.connected = true; link.retryAt = 0; link.hostNext = false;
+      $('connection').textContent = 'Scale connected'; syncControls();
+      return { ok: true, value };
+    } catch (e) {
+      link.retryAt = Date.now() + 1000;
+      const message = e.name === 'AbortError' || e instanceof TypeError
+        ? 'Waiting for your scale — same WiFi, local network access allowed'
+        : e.message;
+      disconnected(message);
+      return { ok: false, err: message };
+    }
+  });
+  link.queue = job.catch(() => {});
+  return job;
+}
+const post = path => getJSON(path, 6000, 'POST');
+
+async function readPairing(device) {
+  let expired = false, timeout;
+  const operation = (async () => {
+    const server = await device.gatt.connect();
+    if (expired) { device.gatt.disconnect(); throw new Error('Pairing timed out.'); }
+    const service = await server.getPrimaryService(DISCOVERY_SERVICE);
+    const characteristic = await service.getCharacteristic(DISCOVERY_ADDRESS);
+    const data = JSON.parse(new TextDecoder().decode(await characteristic.readValue()));
+    if (expired) throw new Error('Pairing timed out.');
+    if (data.host !== SCALE_HOST || !/^[a-f0-9]{12}$/.test(data.id || '')) throw new Error('The scale needs a firmware update.');
+    if (data.ip === '0.0.0.0') throw new Error('Set up the scale WiFi below, then pair again.');
+    scaleURL(data.ip);
+    return { id: data.id, ip: data.ip };
+  })();
+  try {
+    return await Promise.race([operation, new Promise((_, reject) => {
+      timeout = setTimeout(() => { expired = true; device.gatt.disconnect(); reject(new Error('Pairing timed out. Try again with the scale nearby.')); }, 10000);
+    })]);
+  } finally { clearTimeout(timeout); device.gatt.disconnect(); }
+}
+async function pairScale() {
+  if (link.finding || link.running || postBusy) return;
+  if (!navigator.bluetooth?.requestDevice) { $('connection').textContent = 'Open in Chrome on Android to pair your scale.'; return; }
+  link.finding = true; syncControls();
+  $('connection').textContent = 'Choose CoffeeScale';
+  try {
+    // Keep the device picker in the button gesture, before awaiting the HTTP queue.
+    const device = await navigator.bluetooth.requestDevice({ filters: [{ services: [DISCOVERY_SERVICE] }] });
+    const pair = await readPairing(device);
+    await link.queue;
+    link.pair = pair; link.base = scaleURL(pair.ip); link.retryAt = 0; link.hostNext = false;
+    store.set('cs_pair', JSON.stringify(pair));
+    disconnected('Connecting to your scale…');
+  } catch (e) {
+    $('connection').textContent = e.name === 'NotFoundError' ? 'Pairing cancelled' : e.message;
+  } finally { link.finding = false; syncControls(); tick(); }
+}
+async function keepAwake() {
+  if (!navigator.wakeLock || document.visibilityState === 'hidden' || wakeLock) return;
+  try { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.addEventListener('release', () => { wakeLock = null; }); } catch (e) {}
+}
+function startPhoneApp() {
+  $('pairScale').onclick = pairScale;
+  window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installPrompt = e; $('installApp').hidden = false; });
+  $('installApp').onclick = async () => {
+    if (!installPrompt) return;
+    await installPrompt.prompt(); await installPrompt.userChoice;
+    installPrompt = null; $('installApp').hidden = true;
+  };
+  window.addEventListener('appinstalled', () => { $('installApp').hidden = true; $('installHelp').hidden = true; });
+  if (window.matchMedia('(display-mode: standalone)').matches) $('installHelp').hidden = true;
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {
+    $('installHelp').textContent = 'Offline install unavailable. Open this app in Chrome over HTTPS.';
+  });
+  document.addEventListener('click', keepAwake);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') { link.retryAt = 0; keepAwake(); tick(); }
+  });
+  window.addEventListener('online', () => { link.retryAt = 0; tick(); });
+  disconnected(); setStatus(link.pair ? 'Connecting…' : 'Pair once. Then just turn on the scale and open this app.');
+  setInterval(tick, 200); tick();
+}
+async function tick() {
+  if (tickBusy || postBusy || document.visibilityState === 'hidden') return;
+  tickBusy = true;
+  try {
+    const r = await getJSON('/api/weight', 2500);
+    if (!r.ok) { setStatus(r.err); return; }
+    const g = Object.is(r.value.g, -0) ? 0 : r.value.g;
+    $('g').textContent = g.toFixed(1);
+    setStatus(r.value.cal ? '' : 'Scale needs calibration');
+  } finally { tickBusy = false; }
+}
+$('bTare').onclick = async () => {
+  if (!link.connected || postBusy || link.finding) return;
+  postBusy = true; $('bTare').textContent = 'Taring…'; syncControls();
+  try {
+    const r = await post('/api/tare');
+    if (r.ok) { $('g').textContent = '0.0'; setStatus('Tared'); }
+    else setStatus(r.err);
+  } finally { postBusy = false; $('bTare').textContent = 'Tare'; syncControls(); }
+};
+$('scaleSettings').open = !link.pair;
+startPhoneApp();
+</script>
+</body>
+</html>
